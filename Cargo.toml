@@ -2,6 +2,7 @@
 name = "self-auth-dtn"
 version = "0.9.0"
 edition = "2021"
+rust-version = "1.88"
 license = "Apache-2.0 OR MIT"
 description = "Self-authenticating node identifiers for the DTN Bundle Protocol (BPSec): KERI-style pre-committed key rotation, DTKA bulletins with federation and revocation, and post-quantum per-bundle keying."
 repository = "https://example.com/self-auth-dtn"

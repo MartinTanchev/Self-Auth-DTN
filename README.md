@@ -5,8 +5,8 @@ A node's identifier is the hash of its signed key history, so a receiver can
 tell **who sent a bundle from the bundle alone**: offline, with no lookup and
 no handshake, before any key bulletin has arrived.
 
-Research prototype, version 0.9.0. Post-quantum by default (ML-DSA-65,
-ML-KEM-1024), `no_std`, tested against a real bundle agent (uD3TN), with
+Research prototype, version 0.9.0. Post-quantum (ML-DSA-65, ML-KEM-1024,
+feature `pq`), `no_std`, tested against a real bundle agent (uD3TN), with
 Tamarin models of its security properties.
 
 ## Quick start
