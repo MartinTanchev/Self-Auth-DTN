@@ -1,14 +1,48 @@
-# Cargo build output
-/target
+# Build output
+/target/
 
-# Cargo.lock is committed: a security crate should build the audited
-# dependency versions it was tested with.
+# Cargo.lock is committed on purpose: a security crate should build with the
+# audited dependency versions it was tested with.
 
-# Editor / OS noise
+# Run logs (scripts/run-all.sh, formal/prove-lemmas.sh)
+/results/
+/formal/results/
+
+# Archives made to share results or ship the tree
+*.tgz
+*.tar.gz
+*.zip
+
+# Tamarin interactive-mode and proof output
+/formal/*.spthy.proof
+/formal/output/
+
+# Coverage and profiling
+*.profraw
+*.profdata
+lcov.info
+cobertura.xml
+tarpaulin-report.*
+/coverage/
+flamegraph.svg
+perf.data*
+
+# Python (integrations/ud3tn/gen_fields.py)
+__pycache__/
+*.pyc
+.venv/
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editors and OS
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 .DS_Store
-
-formal/results/
-/results/
+Thumbs.db
