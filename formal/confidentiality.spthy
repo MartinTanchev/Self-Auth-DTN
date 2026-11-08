@@ -1,0 +1,134 @@
+theory SelfAuthConfidentiality
+begin
+
+/*
+ * self-auth-dtn 0.9: confidential bundles and epoch-key erasure.
+ * Code: Sender::send_confidential and Receiver::{add_epoch_key,
+ * erase_epochs_before} in src/verify.rs; announce_member_epoch in
+ * src/bulletin.rs; src/kem.rs, src/aead.rs.
+ *
+ * Properties (formal/README.md):
+ *   9  confidentiality      (secrecy rests on the epoch key and the vouching root)
+ *   7  forward_secrecy      (after erasure, only an earlier leak of that epoch key helps)
+ *   10 root_compromise_breaks_confidentiality   (expected attack)
+ *
+ * Abstractions. ML-KEM as an ideal KEM (encaps/decaps with the usual
+ * equation), ChaCha20-Poly1305 as ideal symmetric encryption. The collective
+ * vouches for each epoch key when the destination creates it; the sender
+ * trusts whichever root it was configured with or peered to (trust.spthy
+ * covers how). After erasure the epoch secret is never used or revealed
+ * again (restriction erased_is_gone), which is exactly the guarantee
+ * erase_epochs_before gives against a later full compromise. Each epoch is
+ * keyed once; the code's add_epoch_key can re-key an epoch (see README).
+ */
+
+builtins: signing, symmetric-encryption
+
+functions: kempk/1, encaps/2, decaps/2
+equations: decaps(encaps(k, kempk(sk)), sk) = k
+
+restriction one_root_per_collective:
+  "All C #i #j. NewCollective(C) @ #i & NewCollective(C) @ #j ==> #i = #j"
+
+restriction one_key_per_epoch:
+  "All D e #i #j. EpochKey(D, e) @ #i & EpochKey(D, e) @ #j ==> #i = #j"
+
+rule New_Collective:
+    [ Fr(~rk) ]
+  --[ NewCollective($C) ]->
+    [ !RootKey($C, ~rk), !Root($C, pk(~rk)), Out(pk(~rk)) ]
+
+rule Reveal_Root:
+    [ !RootKey(C, rk) ]
+  --[ RevealRoot(C) ]->
+    [ Out(rk) ]
+
+// Destination D of collective C creates its key for epoch e; C vouches for it
+// by membership bulletin (announce_member_epoch).
+rule New_Epoch_Key:
+    let b = <'member', $D, $e, kempk(~dk)>
+    in
+    [ !RootKey(C, rk), Fr(~dk) ]
+  --[ EpochKey($D, $e), Vouched(C, $D, $e, kempk(~dk)) ]->
+    [ !EpochSecret($D, $e, ~dk), Out(<b, sign(b, rk)>) ]
+
+// Erasure. The secret is a persistent fact for proof efficiency; that nothing
+// uses it after erasure is the restriction below, which is exactly what
+// erase_epochs_before guarantees (the key is destroyed).
+rule Erase_Epoch:
+    [ !EpochSecret(D, e, dk) ]
+  --[ Erased(D, e) ]->
+    [ ]
+
+restriction erased_is_gone:
+  "All D e #x #u. Erased(D, e) @ #x & HoldEpoch(D, e) @ #u ==> #u < #x"
+
+// Compromise of the destination: whatever epoch keys it still holds.
+rule Reveal_Epoch_Key:
+    [ !EpochSecret(D, e, dk) ]
+  --[ RevealEpoch(D, e), HoldEpoch(D, e) ]->
+    [ Out(dk) ]
+
+// The sender encrypts only to a KEM key vouched by a root it trusts.
+rule Send_Confidential:
+    let b = <'member', D, e, ek>
+    in
+    [ !Root(C, pk(rk)), In(<b, sign(b, rk)>), Fr(~k), Fr(~m) ]
+  --[ SentSecret(C, D, e, ~m) ]->
+    [ Out(<D, e, encaps(~k, ek), senc(~m, ~k)>) ]
+
+rule Receive_Confidential:
+    [ !EpochSecret(D, e, dk), In(<D, e, encaps(k, kempk(dk)), senc(m, k)>) ]
+  --[ Decrypted(D, e, m), HoldEpoch(D, e) ]->
+    [ ]
+
+/* ---------------------------------------------------------------------------
+ * Sanity
+ * ------------------------------------------------------------------------- */
+
+lemma exec_deliver_then_erase:
+  exists-trace
+  "Ex C D e m #s #d #x.
+      SentSecret(C, D, e, m) @ #s & Decrypted(D, e, m) @ #d & Erased(D, e) @ #x
+    & #d < #x
+    & not (Ex #r. RevealEpoch(D, e) @ #r) & not (Ex X #r. RevealRoot(X) @ #r)"
+
+/* ---------------------------------------------------------------------------
+ * Property 9: a confidential payload stays secret unless the destination's
+ * epoch key leaked, or the root that vouched for the KEM key was compromised.
+ * ------------------------------------------------------------------------- */
+
+lemma confidentiality:
+  "All C D e m #s #k.
+      SentSecret(C, D, e, m) @ #s & K(m) @ #k
+      ==> (Ex #r. RevealEpoch(D, e) @ #r) | (Ex #r. RevealRoot(C) @ #r)"
+
+/* ---------------------------------------------------------------------------
+ * Property 7: forward secrecy. Once the epoch key is erased, the payload can
+ * have leaked only through a reveal of that key before the erasure (or a
+ * root compromise). A compromise of the destination after erasure yields
+ * nothing for that epoch.
+ * ------------------------------------------------------------------------- */
+
+// Helper: an erased epoch key is gone for good (from the restriction).
+lemma no_reveal_after_erase [reuse]:
+  "All D e #x #r. Erased(D, e) @ #x & RevealEpoch(D, e) @ #r ==> #r < #x"
+
+lemma forward_secrecy:
+  "All C D e m #s #k #x.
+      SentSecret(C, D, e, m) @ #s & K(m) @ #k & Erased(D, e) @ #x
+    & not (Ex #r. RevealRoot(C) @ #r)
+      ==> Ex #r. RevealEpoch(D, e) @ #r & #r < #x"
+
+/* ---------------------------------------------------------------------------
+ * Property 10: where the guarantee stops (expected trace). A compromised root
+ * vouches for an attacker key, and senders encrypt to it.
+ * ------------------------------------------------------------------------- */
+
+lemma root_compromise_breaks_confidentiality:
+  exists-trace
+  "Ex C D e m #s #k #r.
+      SentSecret(C, D, e, m) @ #s & K(m) @ #k & RevealRoot(C) @ #r
+    & not (Ex #x. RevealEpoch(D, e) @ #x)"
+
+end

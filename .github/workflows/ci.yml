@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: thumbv7em-none-eabihf
+      - name: format
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --features "pq ud3tn" -- -D warnings
+      - name: test
+        run: cargo test --all-targets
+      - name: test (pq backend)
+        run: cargo test --all-targets --features pq
+      - name: production build (no mocks)
+        run: cargo build --no-default-features --features pq
+      - name: test (no_std library)
+        run: cargo test --all-targets --no-default-features --features "mock pq"
+      - name: bare-metal build (no_std, thumbv7em)
+        run: cargo build --lib --release --no-default-features --features pq --target thumbv7em-none-eabihf
+      - name: test (uD3TN AAP 2.0 client)
+        run: cargo test --all-targets --features ud3tn
+      - name: examples
+        run: |
+          cargo run --example demo
+          cargo run --example overhead
+          cargo run --release --example coverage
+          cargo run --release --example contactplan
+          cargo run --release --example refscenario

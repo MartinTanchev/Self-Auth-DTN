@@ -1,0 +1,192 @@
+theory SelfAuthPromotion
+begin
+
+/*
+ * self-auth-dtn 0.9: retroactive promotion under revocation.
+ * Code: Receiver::accept_at (receipt stamp) and Receiver::promotable_history
+ * in src/verify.rs; Revocation { effective_at } in src/bulletin.rs.
+ *
+ * Property (formal/README.md):
+ *   5  promotion_after_revocation_is_safe
+ *
+ * Plus the inherent exposure before any revocation arrives
+ * (promotion_before_revocation_is_exposed, expected trace).
+ *
+ * Run with -D=CREATION_TIME to promote by the sender's creation timestamp
+ * instead of this receiver's receipt stamp: a thief backdates, and
+ * promotion_after_revocation_is_safe is expected to be FALSIFIED. This is why
+ * the code keys on receipt time.
+ *
+ * Time without numbers. Tamarin orders events itself, so "received before
+ * the compromise began" is stated as an ordering of two events instead of a
+ * comparison of clock values. (0.9's first version used a multiset clock;
+ * AC unification on it exhausted memory even on the sanity lemma.)
+ *
+ *   - The compromise is an event carrying a fresh label ~c. The honest
+ *     authority states the onset EXACTLY by naming that label (an authority
+ *     that estimates the onset late is not modelled; property 5 assumes
+ *     exactness), or states it as unknown ('zero', which matches no compromise, so promotion under
+ *     it never applies: effective_at = 0 voids the history).
+ *   - The receiver stamps each held bundle with a fresh receipt id ~h; the
+ *     receipt-time rule promotes a held bundle under a revocation only if its
+ *     receipt event precedes the compromise event (restriction
+ *     receipt_time_rule). This is Receiver::promotable_history's
+ *     `received_at < effective_at`, with an accurate clock.
+ *   - Creation timestamps are public epoch labels (Tick). An honest sender
+ *     stamps one; anyone can name any epoch that has been published, which
+ *     is what backdating is. With -D=CREATION_TIME the rule compares the
+ *     claimed epoch with the compromise instead (restriction
+ *     creation_time_rule) and the safety lemma should be FALSIFIED.
+ *
+ * Further abstractions: one authority whose root is not compromised
+ * (authorization is trust.spthy's job), one operational key per identity
+ * (rotation is keylog.spthy's job), at most one compromise per identity.
+ * Membership checks are omitted: promotion here means "survives the
+ * receipt-time rule".
+ */
+
+builtins: signing
+
+restriction authority_once:
+  "All #i #j. AuthorityInit() @ #i & AuthorityInit() @ #j ==> #i = #j"
+
+restriction one_key_per_identity:
+  "All I #i #j. NewIdentity(I) @ #i & NewIdentity(I) @ #j ==> #i = #j"
+
+restriction single_compromise:
+  "All I c1 c2 #i #j. Compromise(I, c1) @ #i & Compromise(I, c2) @ #j ==> #i = #j"
+
+// Unconditional promotion is only for sources this receiver has not (yet)
+// seen revoked.
+restriction unrevoked_promotion_precedes_revocation:
+  "All R I m e #p #v.
+      PromoteUnrevoked(R, I, m) @ #p & RevApplied(R, I, e) @ #v ==> #p < #v"
+
+#ifdef CREATION_TIME
+// Promote under revocation if the bundle's claimed creation epoch was
+// published before the compromise.
+restriction creation_time_rule:
+  "All R I m h tc c #p.
+      PromoteRevoked(R, I, m, h, tc, c) @ #p
+      ==> Ex #x #k. Tick(tc) @ #x & Compromise(I, c) @ #k & #x < #k"
+#else
+// Promote under revocation if this receiver received the bundle before the
+// compromise.
+restriction receipt_time_rule:
+  "All R I m h tc c #p.
+      PromoteRevoked(R, I, m, h, tc, c) @ #p
+      ==> Ex #r #k. Received(R, I, m, h) @ #r & Compromise(I, c) @ #k & #r < #k"
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Time: public epoch labels, for creation timestamps
+ * ------------------------------------------------------------------------- */
+
+rule Tick:
+    [ Fr(~e) ]
+  --[ Tick(~e) ]->
+    [ !Epoch(~e), Out(~e) ]
+
+/* ---------------------------------------------------------------------------
+ * Parties
+ * ------------------------------------------------------------------------- */
+
+rule New_Authority:
+    [ Fr(~rk) ]
+  --[ AuthorityInit() ]->
+    [ !RootKey(~rk), !RootPk(pk(~rk)), Out(pk(~rk)) ]
+
+rule New_Identity:
+    [ Fr(~op) ]
+  --[ NewIdentity($I) ]->
+    [ !OpKey($I, ~op), !OpPk($I, pk(~op)), Out(pk(~op)) ]
+
+// Honest senders stamp a published epoch.
+rule Send:
+    let body = <'bib', I, ~m, e>
+    in
+    [ !OpKey(I, op), !Epoch(e), Fr(~m) ]
+  --[ Sent(I, ~m) ]->
+    [ Out(<body, sign(body, op)>) ]
+
+rule Reveal_Operational:
+    [ !OpKey(I, op), Fr(~c) ]
+  --[ Compromise(I, ~c) ]->
+    [ Out(op), !CompromisedAt(I, ~c) ]
+
+// The honest authority revokes with the accurate onset, or with unknown onset.
+rule Revoke_With_Onset:
+    let r = <'rev', I, c>
+    in
+    [ !RootKey(rk), !CompromisedAt(I, c) ]
+  --[ IssuedRevocation(I, c) ]->
+    [ Out(<r, sign(r, rk)>) ]
+
+rule Revoke_Unknown_Onset:
+    let r = <'rev', $I, 'zero'>
+    in
+    [ !RootKey(rk) ]
+  --[ IssuedRevocation($I, 'zero') ]->
+    [ Out(<r, sign(r, rk)>) ]
+
+/* ---------------------------------------------------------------------------
+ * Receiver: binding verified, stamp with a receipt id, hold; apply
+ * revocations; promote.
+ * ------------------------------------------------------------------------- */
+
+rule Rx_Receive:
+    let body = <'bib', I, m, tc>
+    in
+    [ !OpPk(I, pk(op)), In(<body, sign(body, op)>), Fr(~h) ]
+  --[ Received($R, I, m, ~h) ]->
+    [ !Held($R, I, m, ~h, tc) ]
+
+rule Rx_Apply_Revocation:
+    let r = <'rev', I, e>
+    in
+    [ !RootPk(pk(rk)), In(<r, sign(r, rk)>) ]
+  --[ RevApplied($R, I, e) ]->
+    [ !Revoked($R, I, e) ]
+
+rule Rx_Promote_Revoked:
+    [ !Held(R, I, m, h, tc), !Revoked(R, I, e) ]
+  --[ Promote(R, I, m), PromoteRevoked(R, I, m, h, tc, e) ]->
+    [ ]
+
+rule Rx_Promote_Unrevoked:
+    [ !Held(R, I, m, h, tc) ]
+  --[ Promote(R, I, m), PromoteUnrevoked(R, I, m) ]->
+    [ ]
+
+/* ---------------------------------------------------------------------------
+ * Sanity
+ * ------------------------------------------------------------------------- */
+
+lemma exec_honest_promoted_after_revocation:
+  exists-trace
+  "Ex R I m e #s #v #p.
+      Sent(I, m) @ #s & RevApplied(R, I, e) @ #v & Promote(R, I, m) @ #p & #v < #p"
+
+/* ---------------------------------------------------------------------------
+ * Property 5: once a receiver has applied a revocation, everything it
+ * promotes from that source was sent by the holder. A thief's bundles were
+ * received at or after the compromise, so the receipt-time rule (received
+ * strictly before the stated onset) excludes them; an unknown onset excludes
+ * everything.
+ * ------------------------------------------------------------------------- */
+
+lemma promotion_after_revocation_is_safe:
+  "All R I m e #v #p.
+      RevApplied(R, I, e) @ #v & Promote(R, I, m) @ #p & #v < #p
+      ==> Ex #s. Sent(I, m) @ #s"
+
+/* ---------------------------------------------------------------------------
+ * Where the guarantee stops (expected trace): before the revocation reaches
+ * a receiver, a thief's bundles are promoted like any others.
+ * ------------------------------------------------------------------------- */
+
+lemma promotion_before_revocation_is_exposed:
+  exists-trace
+  "Ex R I m #p. Promote(R, I, m) @ #p & not (Ex #s. Sent(I, m) @ #s)"
+
+end

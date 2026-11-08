@@ -1,0 +1,77 @@
+[package]
+name = "self-auth-dtn"
+version = "0.9.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Self-authenticating node identifiers for the DTN Bundle Protocol (BPSec): KERI-style pre-committed key rotation, DTKA bulletins with federation and revocation, and post-quantum per-bundle keying."
+repository = "https://example.com/self-auth-dtn"
+keywords = ["dtn", "bpsec", "bundle-protocol", "post-quantum", "identity"]
+categories = ["cryptography", "network-programming"]
+# CCSDS reference scenario data is CC BY 4.0, used only by an example.
+exclude = ["scenarios/"]
+
+[features]
+default = ["std", "mock"]
+# The library is `no_std` + `alloc` without this feature (embedded BPAs such
+# as uD3TN on bare metal or an RTOS). `std` adds nothing to the protocol; it
+# only lets ML-DSA signing draw hedging randomness from the OS (FIPS 204
+# hedged mode). Without `std`, ML-DSA signs in the FIPS 204 deterministic
+# mode (rnd = 0^32). Check a no_std build with:
+#   cargo build --no-default-features --features pq --target thumbv7em-none-eabihf
+std = ["fips204?/default-rng"]
+# AAP 2.0 client for the uD3TN bundle agent (src/ud3tn), plus the
+# `ud3tn_node` example. See integrations/ud3tn/README.md.
+ud3tn = ["std"]
+# Insecure mock backends (MockSig, MockKem) used by the test suite and the
+# narrated examples. On by default so `cargo test` works out of the box.
+# Production builds should exclude them:
+#   cargo build --no-default-features --features pq
+mock = []
+# Real post-quantum backends:
+#   signatures    -> FIPS-204 ML-DSA-65  (`fips204`)
+#   encapsulation -> FIPS-203 ML-KEM-1024 (`fips203`)
+# Key generation is deterministic from the caller's 32-byte seed via an
+# in-crate ChaCha20 DRBG (`rng`), so the seed parameter is honest on every
+# backend.
+pq = ["dep:fips204", "dep:fips203", "dep:rand_core", "dep:rand_chacha"]
+
+[dependencies]
+# AEAD: RustCrypto's ChaCha20-Poly1305, independently audited (NCC Group).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# Pure-Rust FIPS-204 (ML-DSA) and FIPS-203 (ML-KEM), pulled in only under `pq`.
+# Note: neither crate is independently audited (see README, "Caveats").
+# Default features off: only the parameter set we use, and no OS RNG unless
+# `std` asks for it. Both crates are no_std and allocation-free.
+fips204 = { version = "0.4", optional = true, default-features = false, features = ["ml-dsa-65"] }
+fips203 = { version = "0.4", optional = true, default-features = false, features = ["ml-kem-1024"] }
+rand_core = { version = "0.6", optional = true, default-features = false }
+rand_chacha = { version = "0.3", optional = true, default-features = false }
+
+[[example]]
+name = "overhead"
+path = "examples/overhead.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+required-features = ["mock"]
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+required-features = ["pq"]
+
+[[example]]
+name = "coverage"
+path = "examples/coverage.rs"
+required-features = ["mock"]
+
+[[example]]
+name = "ud3tn_node"
+path = "examples/ud3tn_node.rs"
+required-features = ["ud3tn"]
+
+[[example]]
+name = "refscenario"
+path = "examples/refscenario.rs"
+required-features = ["mock"]

@@ -1,0 +1,14 @@
+# Cargo build output
+/target
+
+# Cargo.lock is committed: a security crate should build the audited
+# dependency versions it was tested with.
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+formal/results/
+/results/

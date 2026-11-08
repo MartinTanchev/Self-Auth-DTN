@@ -1,0 +1,343 @@
+theory SelfAuthKeyLog
+begin
+
+/*
+ * self-auth-dtn 0.9: identifiers, key logs, binding, first-seen receivers.
+ * Code: src/identity.rs, src/keylog.rs, verify_binding and Receiver::accept_at
+ * in src/verify.rs.
+ *
+ * Properties (formal/README.md):
+ *   1  binding_no_splicing
+ *   1b rotation_ends_exposure
+ *   2  no_takeover_without_next_key
+ *   3  stale_log_cutoff, first_seen_no_branch_switch
+ *   6  ipn_pinned
+ *   10 next_key_theft_takes_over, fork_wins_where_seen_first   (expected attacks)
+ *
+ * Run with -D=V08 for the 0.8 design, in which the revealed key also signed
+ * bundles. There, no_takeover_without_next_key is expected to be FALSIFIED and
+ * v08_operational_key_takeover to find a trace.
+ *
+ * Abstractions. Signatures and hashes are perfect (symbolic model). Key logs
+ * are represented by their head, the hash chain; a bundle names the head of
+ * the log it carries. Positions are not numbered: a child head hashes its
+ * parent, so the chain orders them and validate_chain's index check is
+ * implicit. Holders follow the protocol and generate distinct fresh keys, so
+ * the KeyReuse check of validate_chain is not modelled. Payloads are fresh.
+ *
+ * No linear state, no numbers. Holder and receiver state are persistent
+ * facts written once per transition and only read afterwards; "current" is
+ * a restriction (holder_current, rx_current) that forbids using a state once
+ * a later one exists. Every head is unique (it hashes fresh keys), so a head
+ * names its state. Earlier versions had a linear Holder fact re-produced by
+ * every send and multiset indices; both gave the backward search something
+ * unbounded to unroll. Ancestry along the chain is the subterm order P << H
+ * (helper rx_log_monotone); it replaces an unbounded walk up the chain.
+ */
+
+builtins: hashing, signing
+
+/* ---------------------------------------------------------------------------
+ * Holder (Identity). !HolderState(id, operational secret, next establishment
+ * secret, head, committed ipn), one fact per head. A state is used (sign,
+ * reveal, rotate) only while it is the newest: the code destroys the old
+ * operational and establishment keys on rotation.
+ * ------------------------------------------------------------------------- */
+
+restriction holder_current:
+  "All id head #u #s.
+      HolderUse(id, head) @ #u & HolderNew(id, head) @ #s & #s < #u
+      ==> not (Ex head2 #w. HolderNew(id, head2) @ #w & #s < #w & #w < #u)"
+
+// The inception key k0 signs the inception record and is the first
+// operational key. id = H(inception record).
+rule Incept:
+    let inc = <'inc', pk(~k0), h(pk(~k1)), $n>
+        id  = h(inc)
+    in
+    [ Fr(~k0), Fr(~k1) ]
+  --[ Incept(id, $n), HonestHead(id, id), HolderNew(id, id) ]->
+    [ !HolderState(id, ~k0, ~k1, id, $n), Out(<inc, sign(inc, ~k0)>) ]
+
+#ifdef V08
+// 0.8: the revealed key signs the event and becomes the operational key.
+rule Rotate:
+    let ev = <'rot', pk(nxt), h(pk(~nn)), head>
+        hd = h(ev)
+    in
+    [ !HolderState(id, op, nxt, head, n), Fr(~nn) ]
+  --[ HolderUse(id, head), HolderNew(id, hd),
+      HonestChild(id, head, hd), HonestHead(id, hd), Rotated(id) ]->
+    [ !HolderState(id, nxt, ~nn, hd, n), Out(<ev, sign(ev, nxt)>) ]
+#else
+// 0.9: the revealed establishment key signs the event, which designates a
+// fresh operational key; the establishment key and the old operational key
+// are destroyed (the old state is never used again: holder_current).
+rule Rotate:
+    let ev = <'rot', pk(nxt), pk(~op2), h(pk(~nn)), head>
+        hd = h(ev)
+    in
+    [ !HolderState(id, op, nxt, head, n), Fr(~op2), Fr(~nn) ]
+  --[ HolderUse(id, head), HolderNew(id, hd),
+      HonestChild(id, head, hd), HonestHead(id, hd), Rotated(id) ]->
+    [ !HolderState(id, ~op2, ~nn, hd, n), Out(<ev, sign(ev, nxt)>) ]
+#endif
+
+// The BIB covers the identifier, the claimed name and the payload digest,
+// not the key log (Bundle::protected_bytes).
+rule Send_Self:
+    let body = <'bib', id, 'self', h(~m)>
+    in
+    [ !HolderState(id, op, nxt, head, n), Fr(~m) ]
+  --[ Sent(id, 'self', ~m), HolderUse(id, head) ]->
+    [ Out(<id, 'self', ~m, head, sign(body, op)>) ]
+
+rule Send_Ipn:
+    let name = <'ipn', n>
+        body = <'bib', id, name, h(~m)>
+    in
+    [ !HolderState(id, op, nxt, head, n), Fr(~m) ]
+  --[ Sent(id, name, ~m), HolderUse(id, head) ]->
+    [ Out(<id, name, ~m, head, sign(body, op)>) ]
+
+// Compromise. The operational key is online and exposed by use; the next
+// establishment key is the one pre-rotation assumes is kept safe. Only the
+// current state's keys exist to be stolen (older ones are destroyed).
+rule Reveal_Operational:
+    [ !HolderState(id, op, nxt, head, n) ]
+  --[ RevealOp(id), RevealOpAt(id, head), HolderUse(id, head) ]->
+    [ Out(op) ]
+
+rule Reveal_Next:
+    [ !HolderState(id, op, nxt, head, n) ]
+  --[ RevealNext(id), HolderUse(id, head) ]->
+    [ Out(nxt) ]
+
+/* ---------------------------------------------------------------------------
+ * Verification (validate_chain). !Valid(id, operational key, commitment,
+ * head, committed ipn) holds for every head of every valid log anyone
+ * can present, honest or not.
+ * ------------------------------------------------------------------------- */
+
+rule Valid_Inception:
+    let inc = <'inc', pk(k0), c1, n>
+        id  = h(inc)
+    in
+    [ In(<inc, sign(inc, k0)>) ]
+  --[ ValidHead(id, id), ValidInc(id, n), ValidN(id, n) ]->
+    [ !Valid(id, pk(k0), c1, id, n) ]
+
+#ifdef V08
+rule Valid_Rotation:
+    let ev = <'rot', pk(kn), cn, P>
+        H  = h(ev)
+    in
+    [ !Valid(id, opk, h(pk(kn)), P, n), In(<ev, sign(ev, kn)>) ]
+  --[ ValidHead(id, H), ValidChild(id, P, H), ValidN(id, n) ]->
+    [ !Valid(id, pk(kn), cn, H, n), !Child(id, P, H) ]
+#else
+rule Valid_Rotation:
+    let ev = <'rot', pk(kn), opk2, cn, P>
+        H  = h(ev)
+    in
+    [ !Valid(id, opk, h(pk(kn)), P, n), In(<ev, sign(ev, kn)>) ]
+  --[ ValidHead(id, H), ValidChild(id, P, H), ValidN(id, n) ]->
+    [ !Valid(id, opk2, cn, H, n), !Child(id, P, H) ]
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Receiver (Receiver::accept_at). Keeps the key log it saw first, follows it
+ * only to logs that extend it, and accepts a bundle only under its current
+ * log. Adoptions (RxState) are persistent facts that are only read;
+ * restriction rx_current lets a head be used only while no later head has
+ * been adopted, which is what a single stored log means.
+ * ------------------------------------------------------------------------- */
+
+restriction first_sight_once:
+  "All R id #i #j. RxInit(R, id) @ #i & RxInit(R, id) @ #j ==> #i = #j"
+
+restriction rx_current:
+  "All R id H #u #s.
+      RxUse(R, id, H) @ #u & RxState(R, id, H) @ #s & #s < #u
+      ==> not (Ex H2 #w. RxState(R, id, H2) @ #w & #s < #w & #w < #u)"
+
+rule Rx_First_Sight:
+    [ !Valid(id, opk, c, H, n) ]
+  --[ RxInit($R, id), RxState($R, id, H) ]->
+    [ !RxAdopted($R, id, H) ]
+
+rule Rx_Extend:
+    [ !RxAdopted(R, id, P), !Child(id, P, H) ]
+  --[ RxUse(R, id, P), RxState(R, id, H) ]->
+    [ !RxAdopted(R, id, H) ]
+
+rule Rx_Accept_Self:
+    let body = <'bib', id, 'self', h(m)>
+    in
+    [ !RxAdopted(R, id, H), !Valid(id, pk(op), c, H, n),
+      In(<id, 'self', m, H, sign(body, op)>) ]
+  --[ Accept(R, id, 'self', m, H), RxUse(R, id, H) ]->
+    [ ]
+
+// A claimed ipn number must be the one the inception record commits to.
+rule Rx_Accept_Ipn:
+    let name = <'ipn', n>
+        body = <'bib', id, name, h(m)>
+    in
+    [ !RxAdopted(R, id, H), !Valid(id, pk(op), c, H, n),
+      In(<id, name, m, H, sign(body, op)>) ]
+  --[ Accept(R, id, name, m, H), RxUse(R, id, H) ]->
+    [ ]
+
+/* ---------------------------------------------------------------------------
+ * Sanity: honest runs reach every interesting state without compromise.
+ * ------------------------------------------------------------------------- */
+
+lemma exec_accept_after_rotation:
+  exists-trace
+  "Ex R id P H m #c #i.
+      HonestChild(id, P, H) @ #c & Accept(R, id, 'self', m, H) @ #i
+    & not (Ex #o. RevealOp(id) @ #o) & not (Ex #r. RevealNext(id) @ #r)"
+
+lemma exec_accept_ipn:
+  exists-trace
+  "Ex R id n m H #k #i.
+      Incept(id, n) @ #k & Accept(R, id, <'ipn', n>, m, H) @ #i
+    & not (Ex #o. RevealOp(id) @ #o) & not (Ex #r. RevealNext(id) @ #r)"
+
+/* ---------------------------------------------------------------------------
+ * Property 2: no takeover without the next key. Every valid log head of an
+ * honest identifier was produced by its holder, unless a pre-committed next
+ * establishment key was stolen. Stealing the operational key does not appear:
+ * it never suffices. Expected FALSIFIED with -D=V08.
+ *
+ * Induction over the chain: a valid child of an honest head reveals the key
+ * that head committed to, which only the holder's Rotate or Reveal_Next can
+ * have put a signature or the key itself on the network for.
+ * ------------------------------------------------------------------------- */
+
+#ifdef V08
+lemma no_takeover_without_next_key:
+  "All id H #i n #k.
+      ValidHead(id, H) @ #i & Incept(id, n) @ #k
+      ==> (Ex #j. HonestHead(id, H) @ #j)
+        | (Ex #r. RevealNext(id) @ #r & #r < #i)"
+
+// The 0.8 attack: after one rotation, the operational key alone yields a
+// head the holder never produced, and bundles accepted under it.
+lemma v08_operational_key_takeover:
+  exists-trace
+  "Ex R id H m n #k #o #i.
+      Incept(id, n) @ #k & RevealOp(id) @ #o & Accept(R, id, 'self', m, H) @ #i
+    & not (Ex #h. HonestHead(id, H) @ #h)
+    & not (Ex #r. RevealNext(id) @ #r)"
+#else
+lemma no_takeover_without_next_key [reuse, use_induction]:
+  "All id H #i n #k.
+      ValidHead(id, H) @ #i & Incept(id, n) @ #k
+      ==> (Ex #j. HonestHead(id, H) @ #j)
+        | (Ex #r. RevealNext(id) @ #r & #r < #i)"
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Property 1: binding, no splicing. A bundle accepted under an honest
+ * identifier, with a given claimed name and payload, was sent by the holder
+ * with exactly that name and payload, unless one of its keys was stolen
+ * before. Non-injective by design: DTN tolerates duplicates.
+ * ------------------------------------------------------------------------- */
+
+lemma binding_no_splicing:
+  "All R id name m H #i n #k.
+      Accept(R, id, name, m, H) @ #i & Incept(id, n) @ #k
+      ==> (Ex #j. Sent(id, name, m) @ #j & #j < #i)
+        | (Ex #r. RevealOp(id) @ #r & #r < #i)
+        | (Ex #r. RevealNext(id) @ #r & #r < #i)"
+
+/* ---------------------------------------------------------------------------
+ * Property 1b: rotation ends an operational-key thief's window. Same as
+ * binding_no_splicing, but the stolen operational key must belong to the very
+ * log head the bundle was accepted under: a thief holding the key of an
+ * earlier head gets nothing accepted under a later one.
+ * ------------------------------------------------------------------------- */
+
+lemma rotation_ends_exposure:
+  "All R id name m H #i n #k.
+      Accept(R, id, name, m, H) @ #i & Incept(id, n) @ #k
+      ==> (Ex #j. Sent(id, name, m) @ #j & #j < #i)
+        | (Ex #r. RevealOpAt(id, H) @ #r & #r < #i)
+        | (Ex #r. RevealNext(id) @ #r & #r < #i)"
+
+/* ---------------------------------------------------------------------------
+ * Property 6: ipn pinning. A bundle accepted under ipn number n2 belongs to an
+ * identity whose inception record committed to n2.
+ * ------------------------------------------------------------------------- */
+
+// Helper: every valid head carries the ipn commitment of its inception.
+lemma valid_ipn_from_inception [reuse, use_induction]:
+  "All id n #i. ValidN(id, n) @ #i ==> Ex #j. ValidInc(id, n) @ #j"
+
+lemma ipn_pinned:
+  "All R id n2 m H n #i #k.
+      Accept(R, id, <'ipn', n2>, m, H) @ #i & Incept(id, n) @ #k ==> n2 = n"
+
+/* ---------------------------------------------------------------------------
+ * Property 3: stale logs and forks. A receiver's adopted heads only move
+ * down the chain (helper), so its stored log only moves forward: once it has adopted a
+ * later log it never again accepts under an earlier one (stale-key replay
+ * closed), and it never adopts two different children of one head (a fork
+ * is refused wherever the other branch was seen first).
+ * ------------------------------------------------------------------------- */
+
+// Helper: a later adopted head is the same, or a valid child of a head that
+// equals or descends from the earlier one. Ancestry is the subterm order
+// (a child head hashes its parent, so every ancestor P satisfies P << H).
+//
+// Why not just "each head is adopted once": stale_log_cutoff and
+// first_seen_no_branch_switch need "a parent is never adopted after its
+// child" (a receiver may first see a head in the middle of a chain), and
+// from rx_current alone that takes walking the adoption chain back from the
+// parent until it meets the child, which is unbounded. The subterm order
+// closes it in one step: the child would have to be a strict subterm of
+// itself.
+lemma rx_log_monotone [reuse, use_induction]:
+  "All R id H1 H2 #i #j.
+      RxState(R, id, H1) @ #i & RxState(R, id, H2) @ #j & #i < #j
+      ==> H1 = H2
+        | (Ex P #c. ValidChild(id, P, H2) @ #c & (H1 = P | H1 << P))"
+
+lemma stale_log_cutoff:
+  "not (Ex R id P H name m #c #a #b.
+      ValidChild(id, P, H) @ #c
+    & RxState(R, id, H) @ #a
+    & Accept(R, id, name, m, P) @ #b
+    & #a < #b)"
+
+lemma first_seen_no_branch_switch:
+  "All R id P H1 H2 #c1 #c2 #a #b.
+      ValidChild(id, P, H1) @ #c1 & ValidChild(id, P, H2) @ #c2
+    & RxState(R, id, H1) @ #a & RxState(R, id, H2) @ #b
+      ==> H1 = H2"
+
+/* ---------------------------------------------------------------------------
+ * Property 10: where the guarantees stop (expected attacks, traces found).
+ * ------------------------------------------------------------------------- */
+
+// Stealing the pre-committed next key alone lets the thief rotate the
+// identifier and have bundles accepted under a log the holder never produced.
+lemma next_key_theft_takes_over:
+  exists-trace
+  "Ex R id H m n #k #r #i.
+      Incept(id, n) @ #k & RevealNext(id) @ #r & Accept(R, id, 'self', m, H) @ #i
+    & not (Ex #h. HonestHead(id, H) @ #h)
+    & not (Ex #o. RevealOp(id) @ #o)"
+
+// With the next key stolen, a receiver that meets the thief's fork first
+// keeps it, although the holder rotated at the same position.
+lemma fork_wins_where_seen_first:
+  exists-trace
+  "Ex R id P Hh Hf #c #f #a.
+      HonestChild(id, P, Hh) @ #c & ValidChild(id, P, Hf) @ #f
+    & not (Hf = Hh) & RxState(R, id, Hf) @ #a
+    & not (Ex #o. RevealOp(id) @ #o)"
+
+end

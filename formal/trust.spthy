@@ -1,0 +1,280 @@
+theory SelfAuthTrust
+begin
+
+/*
+ * self-auth-dtn 0.9: DTKA bulletins and authorization.
+ * Code: src/bulletin.rs, src/trust.rs (TrustStore::apply / authorize).
+ *
+ * Properties (formal/README.md):
+ *   4  authorization_sound          (depth-one trust, no chaining)
+ *   8  no_rollback                  (a withdrawn peering cannot be revived by replay)
+ *      purge_on_withdrawal          (a peer membership counts only under its grant)
+ *   10 peer_root_compromise_authorizes_anyone   (expected attack)
+ *
+ * Run with -D=V08 for the 0.8 behaviour, where withdrawal left the peer's
+ * members authorized: no_rollback is then expected to be FALSIFIED.
+ *
+ * Abstractions. Identifiers are public names (binding is keylog.spthy's job).
+ * Each collective has one root and issues bulletins one at a time
+ * (Authority::seq). Membership freshness (replay of an old membership
+ * bulletin) and revocation are not modelled here; record ownership is.
+ *
+ * Sequence numbers without numbers. A bulletin carries a fresh id ~s instead
+ * of a counter, and "s is newer than so" means "the authority issued s after
+ * so", which is exactly what one counter per collective encodes. A forger
+ * holding the root can claim any position.
+ *
+ * Receiver state without linear facts. A receiver's peering with D is the
+ * sequence of updates (grants, withdrawals) it applied; restriction
+ * peer_fresh admits an update only if the authority issued it after every
+ * earlier update applied for D, and restriction peer_current lets a grant be
+ * used only while no later update has been applied. Grants and memberships
+ * are persistent facts that are only read, so the backward search has no
+ * state chain to unroll.
+ *
+ * Grants name real roots. Rx_Apply_Grant requires the granted key to be the
+ * root of some collective. A forged grant naming a key that is nobody's root
+ * (possible once C's root leaks) is equivalent, for every lemma here, to the
+ * attacker standing up a collective and revealing its root, which the model
+ * allows. Without this premise the member-bulletin signature in
+ * Rx_Apply_Member_Peer is checked under an unconstrained key and the search
+ * does not terminate.
+ *
+ * Purge of a withdrawn peer's members (TrustStore, 0.9). A membership from a
+ * peer is recorded under the grant it arrived under (the grant's bulletin id
+ * g) and authorizes only while that same grant is current. After a
+ * withdrawal and re-grant, the old records no longer count; a membership must
+ * arrive again.
+ */
+
+builtins: signing
+
+// Peering updates for one receiver and peer apply in issue order. Replaying
+// an update (same id) or an older one is refused, unless the root is
+// revealed, in which case anything goes.
+restriction peer_fresh:
+  "All R C D n o #i #j.
+      PeerUpdate(R, C, D, n) @ #i & PeerUpdate(R, C, D, o) @ #j & #j < #i
+      ==> (Ex #x #y. Issued(C, o) @ #x & Issued(C, n) @ #y & #x < #y)
+        | (Ex #r. RevealRoot(C) @ #r & #r < #i)"
+
+// A grant is used only while it is the latest update applied for that peer.
+restriction peer_current:
+  "All R C D k g #u #a.
+      PeerUse(R, C, D, g) @ #u & AppliedGrant(R, C, D, k, g) @ #a & #a < #u
+      ==> not (Ex n #w. PeerUpdate(R, C, D, n) @ #w & #a < #w & #w < #u)"
+
+restriction one_root_per_collective:
+  "All C #i #j. NewCollective(C) @ #i & NewCollective(C) @ #j ==> #i = #j"
+
+restriction one_collective_per_receiver:
+  "All R C1 C2 #i #j. NewReceiver(R, C1) @ #i & NewReceiver(R, C2) @ #j ==> #i = #j"
+
+/* ---------------------------------------------------------------------------
+ * Authorities
+ * ------------------------------------------------------------------------- */
+
+rule New_Collective:
+    [ Fr(~rk) ]
+  --[ NewCollective($C) ]->
+    [ !RootKey($C, ~rk), !Root($C, pk(~rk)), Out(pk(~rk)) ]
+
+rule Reveal_Root:
+    [ !RootKey(C, rk) ]
+  --[ RevealRoot(C) ]->
+    [ Out(rk) ]
+
+rule Issue_Member:
+    let b = <'bul', C, ~s, <'member', $id>>
+    in
+    [ !RootKey(C, rk), Fr(~s) ]
+  --[ IssuedMember(C, $id, ~s), Issued(C, ~s) ]->
+    [ Out(<b, sign(b, rk)>) ]
+
+rule Issue_Peering:
+    let b = <'bul', C, ~s, <'peer', D, rootD>>
+    in
+    [ !RootKey(C, rk), !Root(D, rootD), Fr(~s) ]
+  --[ IssuedPeer(C, D, rootD, ~s), Issued(C, ~s) ]->
+    [ Out(<b, sign(b, rk)>) ]
+
+// An empty root key withdraws the peering (Authority::withdraw_peer).
+rule Issue_Withdrawal:
+    let b = <'bul', C, ~s, <'peer', D, 'none'>>
+    in
+    [ !RootKey(C, rk), !Root(D, rootD), Fr(~s) ]
+  --[ IssuedWithdraw(C, D, ~s), Issued(C, ~s) ]->
+    [ Out(<b, sign(b, rk)>) ]
+
+/* ---------------------------------------------------------------------------
+ * Receivers. A receiver is configured with its own collective's root only.
+ * ------------------------------------------------------------------------- */
+
+rule New_Receiver:
+    [ !Root($C, rootC) ]
+  --[ NewReceiver($R, $C) ]->
+    [ !RxRoot($R, $C, rootC) ]
+
+// Peering bulletins count only when signed by the receiver's own root. The
+// granted key must be some collective's root (see the header).
+rule Rx_Apply_Grant:
+    let b = <'bul', C, s, <'peer', D, pk(kD)>>
+    in
+    [ !RxRoot(R, C, pk(kC)), !Root(D, pk(kD)), In(<b, sign(b, kC)>) ]
+  --[ PeerUpdate(R, C, D, s), AppliedGrant(R, C, D, pk(kD), s) ]->
+    [ !Grant(R, C, D, pk(kD), s) ]
+
+rule Rx_Apply_Withdrawal:
+    let b = <'bul', C, s, <'peer', D, 'none'>>
+    in
+    [ !RxRoot(R, C, pk(kC)), In(<b, sign(b, kC)>) ]
+  --[ PeerUpdate(R, C, D, s), AppliedWithdraw(R, C, D, s) ]->
+    [ ]
+
+rule Rx_Apply_Member_Own:
+    let b = <'bul', C, s, <'member', id>>
+    in
+    [ !RxRoot(R, C, pk(kC)), In(<b, sign(b, kC)>) ]
+  --[ AppliedMember(R, C, id) ]->
+    [ !Member(R, C, id) ]
+
+// Membership from a peer counts only while a grant for that peer is current,
+// only under the root that grant named, and is recorded under that grant.
+rule Rx_Apply_Member_Peer:
+    let b = <'bul', D, s, <'member', id>>
+    in
+    [ !Grant(R, C, D, pk(kD), g), In(<b, sign(b, kD)>) ]
+  --[ AppliedMember(R, D, id), PeerUse(R, C, D, g) ]->
+    [ !PeerMember(R, D, id, g) ]
+
+rule Rx_Authorize_Own:
+    [ !RxRoot(R, C, rootC), !Member(R, C, id) ]
+  --[ Authorized(R, C, id) ]->
+    [ ]
+
+rule Rx_Authorize_Via_Peer:
+    [ !Grant(R, C, D, pk(kD), g), !PeerMember(R, D, id, g) ]
+  --[ Authorized(R, C, id), AuthorizedVia(R, id, D), PeerUse(R, C, D, g) ]->
+    [ ]
+
+#ifdef V08
+// 0.8: a member vouched by a peer stayed authorized after the peering was
+// withdrawn; withdrawal only refused the peer's future bulletins. With this
+// rule, no_rollback is expected to be FALSIFIED.
+rule Rx_Authorize_Via_Former_Peer:
+    [ !RxRoot(R, C, rootC), !PeerMember(R, D, id, g) ]
+  --[ Authorized(R, C, id), AuthorizedVia(R, id, D) ]->
+    [ ]
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Sanity
+ * ------------------------------------------------------------------------- */
+
+lemma exec_authorize_via_peer:
+  exists-trace
+  "Ex R C D id #a.
+      Authorized(R, C, id) @ #a & AuthorizedVia(R, id, D) @ #a & not (C = D)
+    & not (Ex X #r. RevealRoot(X) @ #r)"
+
+// After a withdrawal and a newer grant, authorization through the peer works
+// again (with a membership applied under the new grant).
+lemma exec_withdraw_then_regrant:
+  exists-trace
+  "Ex R C D id s #w #a.
+      AppliedWithdraw(R, C, D, s) @ #w & AuthorizedVia(R, id, D) @ #a & #w < #a
+    & not (Ex X #r. RevealRoot(X) @ #r)"
+
+/* ---------------------------------------------------------------------------
+ * Origin helpers. Each applied bulletin was issued by the collective whose
+ * root signed it, or that root has leaked. One rule back plus one signature
+ * each; no induction. Stated once here so the restrictions and the main
+ * lemmas do not re-derive them at every use.
+ * ------------------------------------------------------------------------- */
+
+lemma update_origin [reuse]:
+  "All R C D s #i.
+      PeerUpdate(R, C, D, s) @ #i
+      ==> (Ex #x. Issued(C, s) @ #x & #x < #i)
+        | (Ex #r. RevealRoot(C) @ #r & #r < #i)"
+
+lemma grant_origin [reuse]:
+  "All R C D k g #i.
+      AppliedGrant(R, C, D, k, g) @ #i
+      ==> (Ex #x. IssuedPeer(C, D, k, g) @ #x & #x < #i)
+        | (Ex #r. RevealRoot(C) @ #r & #r < #i)"
+
+lemma withdraw_origin [reuse]:
+  "All R C D s #i.
+      AppliedWithdraw(R, C, D, s) @ #i
+      ==> (Ex #x. IssuedWithdraw(C, D, s) @ #x & #x < #i)
+        | (Ex #r. RevealRoot(C) @ #r & #r < #i)"
+
+// Both membership rules: the bulletin is signed by D's root (D = C for own
+// members), which Rx_Apply_Grant's real-root premise pins to a collective.
+lemma member_origin [reuse]:
+  "All R D id #i.
+      AppliedMember(R, D, id) @ #i
+      ==> (Ex s #x. IssuedMember(D, id, s) @ #x & #x < #i)
+        | (Ex #r. RevealRoot(D) @ #r & #r < #i)"
+
+/* ---------------------------------------------------------------------------
+ * Purge: a membership counts only under the grant it arrived under. Together
+ * with peer_current (a grant is used only while no later update was applied)
+ * this is the code's purge on withdrawal and on re-grant: after either, the
+ * old peer records authorize nothing until a membership arrives again. In
+ * V08 the former-peer rule authorizes without any grant, which no_rollback
+ * catches.
+ * ------------------------------------------------------------------------- */
+
+lemma purge_on_withdrawal:
+  "All R C D id g #u.
+      AuthorizedVia(R, id, D) @ #u & PeerUse(R, C, D, g) @ #u
+      ==> Ex #m. AppliedMember(R, D, id) @ #m & PeerUse(R, C, D, g) @ #m & #m < #u"
+
+/* ---------------------------------------------------------------------------
+ * Property 4: authorization soundness, depth one. A receiver in collective C
+ * authorizes id only if C's root vouched for it, or a collective D that C's
+ * root peered with directly vouched for it, unless C's root, or the root of a
+ * collective C peered with, was compromised. A peer's peers never count.
+ * ------------------------------------------------------------------------- */
+
+lemma authorization_sound:
+  "All R C id #a.
+      Authorized(R, C, id) @ #a
+      ==> (Ex s #m. IssuedMember(C, id, s) @ #m)
+        | (Ex D root s1 s2 #p #m.
+             IssuedPeer(C, D, root, s1) @ #p & IssuedMember(D, id, s2) @ #m)
+        | (Ex #r. RevealRoot(C) @ #r & #r < #a)
+        | (Ex D root s1 #p #r.
+             IssuedPeer(C, D, root, s1) @ #p & RevealRoot(D) @ #r & #r < #a)"
+
+/* ---------------------------------------------------------------------------
+ * Property 8: no rollback. After a receiver applies the withdrawal of a
+ * peering at sequence s, it authorizes through that peer again only if its
+ * root issued a grant after that withdrawal (a higher sequence number).
+ * Replaying the old grant changes nothing.
+ * ------------------------------------------------------------------------- */
+
+lemma no_rollback:
+  "All R C D s id #w #a.
+      AppliedWithdraw(R, C, D, s) @ #w & AuthorizedVia(R, id, D) @ #a & #w < #a
+      ==> (Ex root s2 #x #g.
+             IssuedWithdraw(C, D, s) @ #x & IssuedPeer(C, D, root, s2) @ #g & #x < #g)
+        | (Ex #r. RevealRoot(C) @ #r)"
+
+/* ---------------------------------------------------------------------------
+ * Property 10: where the guarantees stop (expected attack, trace found).
+ * A compromised peer root authorizes any identifier at every receiver whose
+ * collective peers with it.
+ * ------------------------------------------------------------------------- */
+
+lemma peer_root_compromise_authorizes_anyone:
+  exists-trace
+  "Ex R C D id #a #r.
+      Authorized(R, C, id) @ #a & AuthorizedVia(R, id, D) @ #a & RevealRoot(D) @ #r
+    & not (Ex s #m. IssuedMember(C, id, s) @ #m)
+    & not (Ex s #m. IssuedMember(D, id, s) @ #m)
+    & not (Ex #x. RevealRoot(C) @ #x)"
+
+end

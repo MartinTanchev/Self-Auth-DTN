@@ -1,0 +1,51 @@
+# CI for GitLab (D3TN hosts µD3TN on GitLab).
+# Style jobs are allowed to fail so they inform without blocking; the test
+# jobs are the real gate.
+
+stages:
+  - check
+  - test
+
+default:
+  image: rust:latest
+  before_script:
+    - rustc --version && cargo --version
+
+fmt:
+  stage: check
+  allow_failure: true
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: check
+  allow_failure: true
+  script:
+    - rustup component add clippy
+    - cargo clippy --all-targets
+
+test:
+  stage: test
+  script:
+    - cargo test --all-targets
+
+test-pq:
+  stage: test
+  script:
+    - cargo test --all-targets --features pq
+
+build-production:
+  stage: test
+  script:
+    # Prove the production build excludes the insecure mock backends entirely.
+    - cargo build --no-default-features --features pq
+
+examples:
+  stage: test
+  script:
+    - cargo run --example demo
+    - cargo run --example overhead
+    - cargo run --release --example coverage
+    - cargo run --release --example contactplan
+    - cargo run --release --example refscenario
