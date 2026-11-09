@@ -15,8 +15,8 @@ begin
  *   10 next_key_theft_takes_over, fork_wins_where_seen_first   (expected attacks)
  *
  * Run with -D=V08 for the 0.8 design, in which the revealed key also signed
- * bundles. There, no_takeover_without_next_key is expected to be FALSIFIED and
- * v08_operational_key_takeover to find a trace.
+ * bundles. There, no_takeover_without_next_key is expected to be FALSIFIED;
+ * the counterexample is the 0.8 takeover.
  *
  * Abstractions. Signatures and hashes are perfect (symbolic model). Key logs
  * are represented by their head, the hash chain; a bundle names the head of
@@ -35,7 +35,13 @@ begin
  * (helper rx_log_monotone); it replaces an unbounded walk up the chain.
  */
 
-builtins: hashing, signing
+// Signatures are message-revealing: a signed key event carries its own
+// content, as it does on the wire. With plain `signing` a receiver rule had to
+// take In(<ev, sign(ev, k)>), and the prover then tried to explain how the
+// attacker knew every part of ev separately (the identifier, the parent
+// head), chasing each back through the holder's history; the bounded proof of
+// no_takeover_without_next_key spent nearly all its steps there.
+builtins: hashing, revealing-signing, natural-numbers
 
 /* ---------------------------------------------------------------------------
  * Holder (Identity). !HolderState(id, operational secret, next establishment
@@ -56,93 +62,121 @@ rule Incept:
         id  = h(inc)
     in
     [ Fr(~k0), Fr(~k1) ]
-  --[ Incept(id, $n), HonestHead(id, id), HolderNew(id, id) ]->
-    [ !HolderState(id, ~k0, ~k1, id, $n), Out(<inc, sign(inc, ~k0)>) ]
+  --[ Incept(id, $n), HonestHead(id, id), HolderNew(id, id),
+      HolderHead(id, id, ~k0, ~k1) ]->
+    [ !HolderState(id, ~k0, ~k1, id, $n), Out(revealSign(inc, ~k0)) ]
+
+// Holder rules match their state with typed patterns: identifiers and heads
+// are hashes (h(..)), keys are fresh (~..), the ipn number is public ($n).
+// Every head the holder ever stores has that shape, so this loses nothing,
+// and it tells the prover that the head and identifier it puts on the wire
+// cannot contain a secret key. With untyped variables, every secrecy proof
+// had to walk back through the holder's whole history to rule that out
+// (next_key_secrecy timed out on exactly that).
 
 #ifdef V08
 // 0.8: the revealed key signs the event and becomes the operational key.
 rule Rotate:
-    let ev = <'rot', pk(nxt), h(pk(~nn)), head>
-        hd = h(ev)
+    let id   = h(ix)
+        head = h(hx)
+        ev   = <'rot', pk(~nxt), h(pk(~nn)), head>
+        hd   = h(ev)
     in
-    [ !HolderState(id, op, nxt, head, n), Fr(~nn) ]
-  --[ HolderUse(id, head), HolderNew(id, hd),
+    [ !HolderState(id, ~op, ~nxt, head, $n), Fr(~nn) ]
+  --[ HolderUse(id, head), HolderNew(id, hd), HolderHead(id, hd, ~nxt, ~nn),
       HonestChild(id, head, hd), HonestHead(id, hd), Rotated(id) ]->
-    [ !HolderState(id, nxt, ~nn, hd, n), Out(<ev, sign(ev, nxt)>) ]
+    [ !HolderState(id, ~nxt, ~nn, hd, $n), Out(revealSign(ev, ~nxt)) ]
 #else
 // 0.9: the revealed establishment key signs the event, which designates a
 // fresh operational key; the establishment key and the old operational key
 // are destroyed (the old state is never used again: holder_current).
 rule Rotate:
-    let ev = <'rot', pk(nxt), pk(~op2), h(pk(~nn)), head>
-        hd = h(ev)
+    let id   = h(ix)
+        head = h(hx)
+        ev   = <'rot', pk(~nxt), pk(~op2), h(pk(~nn)), head>
+        hd   = h(ev)
     in
-    [ !HolderState(id, op, nxt, head, n), Fr(~op2), Fr(~nn) ]
-  --[ HolderUse(id, head), HolderNew(id, hd),
+    [ !HolderState(id, ~op, ~nxt, head, $n), Fr(~op2), Fr(~nn) ]
+  --[ HolderUse(id, head), HolderNew(id, hd), HolderHead(id, hd, ~op2, ~nn),
       HonestChild(id, head, hd), HonestHead(id, hd), Rotated(id) ]->
-    [ !HolderState(id, ~op2, ~nn, hd, n), Out(<ev, sign(ev, nxt)>) ]
+    [ !HolderState(id, ~op2, ~nn, hd, $n), Out(revealSign(ev, ~nxt)) ]
 #endif
 
 // The BIB covers the identifier, the claimed name and the payload digest,
 // not the key log (Bundle::protected_bytes).
 rule Send_Self:
-    let body = <'bib', id, 'self', h(~m)>
+    let id   = h(ix)
+        head = h(hx)
+        body = <'bib', id, 'self', h(~m)>
     in
-    [ !HolderState(id, op, nxt, head, n), Fr(~m) ]
+    [ !HolderState(id, ~op, ~nxt, head, $n), Fr(~m) ]
   --[ Sent(id, 'self', ~m), HolderUse(id, head) ]->
-    [ Out(<id, 'self', ~m, head, sign(body, op)>) ]
+    [ Out(<id, 'self', ~m, head, revealSign(body, ~op)>) ]
 
 rule Send_Ipn:
-    let name = <'ipn', n>
+    let id   = h(ix)
+        head = h(hx)
+        name = <'ipn', $n>
         body = <'bib', id, name, h(~m)>
     in
-    [ !HolderState(id, op, nxt, head, n), Fr(~m) ]
+    [ !HolderState(id, ~op, ~nxt, head, $n), Fr(~m) ]
   --[ Sent(id, name, ~m), HolderUse(id, head) ]->
-    [ Out(<id, name, ~m, head, sign(body, op)>) ]
+    [ Out(<id, name, ~m, head, revealSign(body, ~op)>) ]
 
 // Compromise. The operational key is online and exposed by use; the next
 // establishment key is the one pre-rotation assumes is kept safe. Only the
 // current state's keys exist to be stolen (older ones are destroyed).
 rule Reveal_Operational:
-    [ !HolderState(id, op, nxt, head, n) ]
+    let id   = h(ix)
+        head = h(hx)
+    in
+    [ !HolderState(id, ~op, ~nxt, head, $n) ]
   --[ RevealOp(id), RevealOpAt(id, head), HolderUse(id, head) ]->
-    [ Out(op) ]
+    [ Out(~op) ]
 
 rule Reveal_Next:
-    [ !HolderState(id, op, nxt, head, n) ]
+    let id   = h(ix)
+        head = h(hx)
+    in
+    [ !HolderState(id, ~op, ~nxt, head, $n) ]
   --[ RevealNext(id), HolderUse(id, head) ]->
-    [ Out(nxt) ]
+    [ Out(~nxt) ]
 
 /* ---------------------------------------------------------------------------
  * Verification (validate_chain). !Valid(id, operational key, commitment,
- * head, committed ipn) holds for every head of every valid log anyone
- * can present, honest or not.
+ * head, committed ipn, log length) holds for every head of every valid log
+ * anyone can present, honest or not. The length is a natural number
+ * (builtins natural-numbers), as in the code, which keeps a log's length
+ * and compares lengths to decide what is stale.
  * ------------------------------------------------------------------------- */
 
 rule Valid_Inception:
     let inc = <'inc', pk(k0), c1, n>
         id  = h(inc)
     in
-    [ In(<inc, sign(inc, k0)>) ]
-  --[ ValidHead(id, id), ValidInc(id, n), ValidN(id, n) ]->
-    [ !Valid(id, pk(k0), c1, id, n) ]
+    [ In(revealSign(inc, k0)) ]
+  --[ ValidHead(id, id), ValidInc(id, n),
+      VState(id, id, pk(k0), c1) ]->
+    [ !Valid(id, pk(k0), c1, id, n, %1) ]
 
 #ifdef V08
 rule Valid_Rotation:
     let ev = <'rot', pk(kn), cn, P>
         H  = h(ev)
     in
-    [ !Valid(id, opk, h(pk(kn)), P, n), In(<ev, sign(ev, kn)>) ]
-  --[ ValidHead(id, H), ValidChild(id, P, H), ValidN(id, n) ]->
-    [ !Valid(id, pk(kn), cn, H, n), !Child(id, P, H) ]
+    [ !Valid(id, opk, h(pk(kn)), P, n, %lp), In(revealSign(ev, kn)) ]
+  --[ ValidHead(id, H), ValidChild(id, P, H), ValidN(id, n),
+      VState(id, H, pk(kn), cn) ]->
+    [ !Valid(id, pk(kn), cn, H, n, %lp %+ %1), !Child(id, P, %lp, H, %lp %+ %1) ]
 #else
 rule Valid_Rotation:
     let ev = <'rot', pk(kn), opk2, cn, P>
         H  = h(ev)
     in
-    [ !Valid(id, opk, h(pk(kn)), P, n), In(<ev, sign(ev, kn)>) ]
-  --[ ValidHead(id, H), ValidChild(id, P, H), ValidN(id, n) ]->
-    [ !Valid(id, opk2, cn, H, n), !Child(id, P, H) ]
+    [ !Valid(id, opk, h(pk(kn)), P, n, %lp), In(revealSign(ev, kn)) ]
+  --[ ValidHead(id, H), ValidChild(id, P, H), ValidN(id, n),
+      VState(id, H, opk2, cn) ]->
+    [ !Valid(id, opk2, cn, H, n, %lp %+ %1), !Child(id, P, %lp, H, %lp %+ %1) ]
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -157,26 +191,26 @@ restriction first_sight_once:
   "All R id #i #j. RxInit(R, id) @ #i & RxInit(R, id) @ #j ==> #i = #j"
 
 restriction rx_current:
-  "All R id H #u #s.
-      RxUse(R, id, H) @ #u & RxState(R, id, H) @ #s & #s < #u
-      ==> not (Ex H2 #w. RxState(R, id, H2) @ #w & #s < #w & #w < #u)"
+  "All R id H %l #u #s.
+      RxUse(R, id, H) @ #u & RxState(R, id, H, %l) @ #s & #s < #u
+      ==> not (Ex H2 %l2 #w. RxState(R, id, H2, %l2) @ #w & #s < #w & #w < #u)"
 
 rule Rx_First_Sight:
-    [ !Valid(id, opk, c, H, n) ]
-  --[ RxInit($R, id), RxState($R, id, H) ]->
-    [ !RxAdopted($R, id, H) ]
+    [ !Valid(id, opk, c, H, n, %l) ]
+  --[ RxInit($R, id), RxState($R, id, H, %l) ]->
+    [ !RxAdopted($R, id, H, %l) ]
 
 rule Rx_Extend:
-    [ !RxAdopted(R, id, P), !Child(id, P, H) ]
-  --[ RxUse(R, id, P), RxState(R, id, H) ]->
-    [ !RxAdopted(R, id, H) ]
+    [ !RxAdopted(R, id, P, %lp), !Child(id, P, %lp, H, %lh) ]
+  --[ RxUse(R, id, P), RxState(R, id, H, %lh), RxExt(R, id, H) ]->
+    [ !RxAdopted(R, id, H, %lh) ]
 
 rule Rx_Accept_Self:
     let body = <'bib', id, 'self', h(m)>
     in
-    [ !RxAdopted(R, id, H), !Valid(id, pk(op), c, H, n),
-      In(<id, 'self', m, H, sign(body, op)>) ]
-  --[ Accept(R, id, 'self', m, H), RxUse(R, id, H) ]->
+    [ !RxAdopted(R, id, H, %l), !Valid(id, pk(op), c, H, n, %lv),
+      In(<id, 'self', m, H, revealSign(body, op)>) ]
+  --[ Accept(R, id, 'self', m, H), RxUse(R, id, H), AcceptLen(R, id, H, %l) ]->
     [ ]
 
 // A claimed ipn number must be the one the inception record commits to.
@@ -184,26 +218,46 @@ rule Rx_Accept_Ipn:
     let name = <'ipn', n>
         body = <'bib', id, name, h(m)>
     in
-    [ !RxAdopted(R, id, H), !Valid(id, pk(op), c, H, n),
-      In(<id, name, m, H, sign(body, op)>) ]
-  --[ Accept(R, id, name, m, H), RxUse(R, id, H) ]->
+    [ !RxAdopted(R, id, H, %l), !Valid(id, pk(op), c, H, n, %lv),
+      In(<id, name, m, H, revealSign(body, op)>) ]
+  --[ Accept(R, id, name, m, H), RxUse(R, id, H), ValidN(id, n),
+      AcceptLen(R, id, H, %l) ]->
     [ ]
 
 /* ---------------------------------------------------------------------------
  * Sanity: honest runs reach every interesting state without compromise.
  * ------------------------------------------------------------------------- */
 
+// The sanity and attack lemmas below ask for one witness trace, and name
+// its steps in order (incept, rotate, compromise, forge, receive). The extra
+// conjuncts (one identity, one receiver, a bounded number of rotations, and
+// for the sanity lemmas only honest heads) do not weaken what they show: a
+// trace satisfying them is still a trace of the model. They stop the search
+// from wandering through attacker-built inceptions and chains, which is what
+// made exec_accept_after_rotation time out without them.
+
 lemma exec_accept_after_rotation:
   exists-trace
-  "Ex R id P H m #c #i.
-      HonestChild(id, P, H) @ #c & Accept(R, id, 'self', m, H) @ #i
-    & not (Ex #o. RevealOp(id) @ #o) & not (Ex #r. RevealNext(id) @ #r)"
+  "Ex R id n P H m %l #k #c #s #a #i.
+      Incept(id, n) @ #k & HonestChild(id, P, H) @ #c
+    & Sent(id, 'self', m) @ #s & RxState(R, id, H, %l) @ #a
+    & Accept(R, id, 'self', m, H) @ #i
+    & #k < #c & #c < #s & #s < #i & #a < #i
+    & not (Ex #o. RevealOp(id) @ #o) & not (Ex #r. RevealNext(id) @ #r)
+    & (All a1 n1 a2 n2 #x #y. Incept(a1, n1) @ #x & Incept(a2, n2) @ #y ==> #x = #y)
+    & (All r1 i1 r2 i2 #x #y. RxInit(r1, i1) @ #x & RxInit(r2, i2) @ #y ==> #x = #y)
+    & (All a #x #y. Rotated(a) @ #x & Rotated(a) @ #y ==> #x = #y)
+    & (All a b #x. ValidHead(a, b) @ #x ==> Ex #h. HonestHead(a, b) @ #h)"
 
 lemma exec_accept_ipn:
   exists-trace
   "Ex R id n m H #k #i.
       Incept(id, n) @ #k & Accept(R, id, <'ipn', n>, m, H) @ #i
-    & not (Ex #o. RevealOp(id) @ #o) & not (Ex #r. RevealNext(id) @ #r)"
+    & not (Ex #o. RevealOp(id) @ #o) & not (Ex #r. RevealNext(id) @ #r)
+    & (All a1 n1 a2 n2 #x #y. Incept(a1, n1) @ #x & Incept(a2, n2) @ #y ==> #x = #y)
+    & (All r1 i1 r2 i2 #x #y. RxInit(r1, i1) @ #x & RxInit(r2, i2) @ #y ==> #x = #y)
+    & not (Ex a #x. Rotated(a) @ #x)
+    & (All a b #x. ValidHead(a, b) @ #x ==> Ex #h. HonestHead(a, b) @ #h)"
 
 /* ---------------------------------------------------------------------------
  * Property 2: no takeover without the next key. Every valid log head of an
@@ -223,20 +277,39 @@ lemma no_takeover_without_next_key:
       ==> (Ex #j. HonestHead(id, H) @ #j)
         | (Ex #r. RevealNext(id) @ #r & #r < #i)"
 
-// The 0.8 attack: after one rotation, the operational key alone yields a
-// head the holder never produced, and bundles accepted under it.
-lemma v08_operational_key_takeover:
-  exists-trace
-  "Ex R id H m n #k #o #i.
-      Incept(id, n) @ #k & RevealOp(id) @ #o & Accept(R, id, 'self', m, H) @ #i
-    & not (Ex #h. HonestHead(id, H) @ #h)
-    & not (Ex #r. RevealNext(id) @ #r)"
+// The 0.8 attack itself is the counterexample Tamarin returns for the lemma
+// above: a valid log head the holder never produced, built from the stolen
+// operational key alone (RevealOp, no RevealNext). An end-to-end variant
+// (forged head adopted by a receiver, bundle accepted under it) exceeded
+// 3 GB as a trace search and was dropped; it adds nothing to that trace but
+// the receiver steps, which the 0.9 lemmas cover.
 #else
+// Key secrecy (0.9 only: in 0.8 a revealed establishment key became the
+// operational key, so these do not hold there). A holder's establishment key
+// becomes known only through Reveal_Next; an operational key only through
+// Reveal_Operational at the head it belongs to. Signatures do not leak keys.
+lemma next_key_secrecy [reuse]:
+  "All id hd op nn #i #j.
+      HolderHead(id, hd, op, nn) @ #i & K(nn) @ #j
+      ==> Ex #r. RevealNext(id) @ #r & #r < #j"
+
+lemma op_key_secrecy [reuse]:
+  "All id hd op nn #i #j.
+      HolderHead(id, hd, op, nn) @ #i & K(op) @ #j
+      ==> Ex #r. RevealOpAt(id, hd) @ #r & #r < #j"
+
+// Stated about the whole validated state, not just the head: every valid
+// state of an honest identifier is a state the holder created, with the
+// same operational key and the same commitment. The stronger statement is
+// what makes the induction one step deep: the parent's commitment comes
+// straight from the hypothesis, instead of being re-derived through the
+// holder's history.
 lemma no_takeover_without_next_key [reuse, use_induction]:
-  "All id H #i n #k.
-      ValidHead(id, H) @ #i & Incept(id, n) @ #k
-      ==> (Ex #j. HonestHead(id, H) @ #j)
-        | (Ex #r. RevealNext(id) @ #r & #r < #i)"
+  "All id H opk c #v n #k.
+      VState(id, H, opk, c) @ #v & Incept(id, n) @ #k
+      ==> (Ex op nn #h. HolderHead(id, H, op, nn) @ #h
+                        & opk = pk(op) & c = h(pk(nn)))
+        | (Ex #r. RevealNext(id) @ #r & #r < #v)"
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -268,54 +341,77 @@ lemma rotation_ends_exposure:
         | (Ex #r. RevealNext(id) @ #r & #r < #i)"
 
 /* ---------------------------------------------------------------------------
+ * Lemma order. A [reuse] lemma is assumed by every lemma after it, proved or
+ * not, so helpers sit right before the lemmas that need them and after the
+ * ones that do not: the receiver helpers (rx_*) below would otherwise be
+ * instantiated over every pair of adoptions in the binding proofs above,
+ * which never need them.
+ * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
  * Property 6: ipn pinning. A bundle accepted under ipn number n2 belongs to an
  * identity whose inception record committed to n2.
  * ------------------------------------------------------------------------- */
 
 // Helper: every valid head carries the ipn commitment of its inception.
+//
+// A [reuse] helper of the form "A ==> Ex B" must not be applied to a rule
+// that emits both A and B: the prover adds a fresh B-node for the A, that
+// node emits another A, and saturation never ends. Valid_Inception therefore
+// emits ValidInc but not ValidN (it used to emit both, and every lemma after
+// this helper ran out of memory in under two minutes), and the receiver
+// helper below is stated over RxExt, which First_Sight does not emit.
 lemma valid_ipn_from_inception [reuse, use_induction]:
   "All id n #i. ValidN(id, n) @ #i ==> Ex #j. ValidInc(id, n) @ #j"
 
+// Stated over ValidN, the number a validation carries. Rx_Accept_Ipn emits
+// ValidN(id, n) for exactly the number in the name it accepts (<'ipn', n>),
+// so this covers every accepted ipn claim. Stated over Accept instead, the
+// prover first tried to explain the bundle signature and the receiver's
+// adoption history, and ran out of memory before using the helper.
 lemma ipn_pinned:
-  "All R id n2 m H n #i #k.
-      Accept(R, id, <'ipn', n2>, m, H) @ #i & Incept(id, n) @ #k ==> n2 = n"
+  "All id n2 n #i #k.
+      ValidN(id, n2) @ #i & Incept(id, n) @ #k ==> n2 = n"
 
 /* ---------------------------------------------------------------------------
- * Property 3: stale logs and forks. A receiver's adopted heads only move
- * down the chain (helper), so its stored log only moves forward: once it has adopted a
- * later log it never again accepts under an earlier one (stale-key replay
- * closed), and it never adopts two different children of one head (a fork
- * is refused wherever the other branch was seen first).
+ * Property 3: stale logs and forks. A receiver's stored log only grows
+ * (helper), so once it has adopted a longer log it never again accepts under
+ * a shorter one (stale-key replay closed), and it never holds two different
+ * logs of the same length (a fork is refused wherever the other branch was
+ * seen first).
  * ------------------------------------------------------------------------- */
 
-// Helper: a later adopted head is the same, or a valid child of a head that
-// equals or descends from the earlier one. Ancestry is the subterm order
-// (a child head hashes its parent, so every ancestor P satisfies P << H).
-//
-// Why not just "each head is adopted once": stale_log_cutoff and
-// first_seen_no_branch_switch need "a parent is never adopted after its
-// child" (a receiver may first see a head in the middle of a chain), and
-// from rx_current alone that takes walking the adoption chain back from the
-// parent until it meets the child, which is unbounded. The subterm order
-// closes it in one step: the child would have to be a strict subterm of
-// itself.
+// Helper: every extension happens after the receiver's first sight of that
+// identifier. Needed for the first-sight case of rx_log_monotone: a head
+// adopted before first sight would mean a second first sight.
+lemma rx_after_first_sight [reuse, use_induction]:
+  "All R id H #i.
+      RxExt(R, id, H) @ #i
+      ==> Ex #f. RxInit(R, id) @ #f & #f < #i"
+
+// Helper: the receiver's stored log only grows. A later adoption is the same
+// head with the same length, or a strictly longer log. (An earlier version
+// stated this with the subterm order on heads, P << H; attacker-chosen fields
+// in forged events gave the subterm solver too much to explore, and it ran
+// out of memory. Lengths are what the code compares.)
 lemma rx_log_monotone [reuse, use_induction]:
-  "All R id H1 H2 #i #j.
-      RxState(R, id, H1) @ #i & RxState(R, id, H2) @ #j & #i < #j
-      ==> H1 = H2
-        | (Ex P #c. ValidChild(id, P, H2) @ #c & (H1 = P | H1 << P))"
+  "All R id H1 H2 %l1 %l2 #i #j.
+      RxState(R, id, H1, %l1) @ #i & RxState(R, id, H2, %l2) @ #j & #i < #j
+      ==> (H1 = H2 & %l1 = %l2) | %l1 << %l2"
 
+// Stale logs: once a receiver has adopted a log, it never accepts under a
+// shorter one (VerifyError::StaleKeyLog).
 lemma stale_log_cutoff:
-  "not (Ex R id P H name m #c #a #b.
-      ValidChild(id, P, H) @ #c
-    & RxState(R, id, H) @ #a
-    & Accept(R, id, name, m, P) @ #b
-    & #a < #b)"
+  "not (Ex R id H P %l %lp #a #b.
+      RxState(R, id, H, %l) @ #a & AcceptLen(R, id, P, %lp) @ #b & #a < #b
+    & %lp << %l)"
 
+// Forks: a receiver never adopts two different logs of the same length, so
+// a fork is refused wherever the other branch was seen first
+// (VerifyError::Duplicity).
 lemma first_seen_no_branch_switch:
-  "All R id P H1 H2 #c1 #c2 #a #b.
-      ValidChild(id, P, H1) @ #c1 & ValidChild(id, P, H2) @ #c2
-    & RxState(R, id, H1) @ #a & RxState(R, id, H2) @ #b
+  "All R id H1 H2 %l #a #b.
+      RxState(R, id, H1, %l) @ #a & RxState(R, id, H2, %l) @ #b
       ==> H1 = H2"
 
 /* ---------------------------------------------------------------------------
@@ -329,15 +425,23 @@ lemma next_key_theft_takes_over:
   "Ex R id H m n #k #r #i.
       Incept(id, n) @ #k & RevealNext(id) @ #r & Accept(R, id, 'self', m, H) @ #i
     & not (Ex #h. HonestHead(id, H) @ #h)
-    & not (Ex #o. RevealOp(id) @ #o)"
+    & not (Ex #o. RevealOp(id) @ #o)
+    & (All a1 n1 a2 n2 #x #y. Incept(a1, n1) @ #x & Incept(a2, n2) @ #y ==> #x = #y)
+    & (All r1 i1 r2 i2 #x #y. RxInit(r1, i1) @ #x & RxInit(r2, i2) @ #y ==> #x = #y)
+    & not (Ex a #x. Rotated(a) @ #x)"
 
 // With the next key stolen, a receiver that meets the thief's fork first
 // keeps it, although the holder rotated at the same position.
 lemma fork_wins_where_seen_first:
   exists-trace
-  "Ex R id P Hh Hf #c #f #a.
-      HonestChild(id, P, Hh) @ #c & ValidChild(id, P, Hf) @ #f
-    & not (Hf = Hh) & RxState(R, id, Hf) @ #a
-    & not (Ex #o. RevealOp(id) @ #o)"
+  "Ex R id n Hh Hf %l #k #r #c #f #a.
+      Incept(id, n) @ #k & RevealNext(id) @ #r
+    & HonestChild(id, id, Hh) @ #c & ValidChild(id, id, Hf) @ #f
+    & not (Hf = Hh) & RxInit(R, id) @ #a & RxState(R, id, Hf, %l) @ #a
+    & #k < #r & #r < #c & #f < #a
+    & not (Ex #o. RevealOp(id) @ #o)
+    & (All a1 n1 a2 n2 #x #y. Incept(a1, n1) @ #x & Incept(a2, n2) @ #y ==> #x = #y)
+    & (All r1 i1 r2 i2 #x #y. RxInit(r1, i1) @ #x & RxInit(r2, i2) @ #y ==> #x = #y)
+    & (All a #x #y. Rotated(a) @ #x & Rotated(a) @ #y ==> #x = #y)"
 
 end

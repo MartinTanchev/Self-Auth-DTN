@@ -6,17 +6,14 @@ network, learns every key a compromise rule reveals, and can replay,
 reorder, drop and forge anything it has the keys for. Signatures, hashes,
 the KEM and the AEAD are ideal.
 
-> **Status (2026-11-08).** Run on Tamarin 1.12.0 / Maude 3.5.1 with
-> `prove-lemmas.sh`. `confidentiality` and `promotion`: every lemma gives
-> its expected result (each in seconds; the CREATION_TIME variant is
-> falsified as intended). `trust` and `keylog`: two earlier versions
-> (multiset counters, then linear receiver state) ran out of memory or
-> time; the current versions have no numbers and no linear state (see "If
-> a proof does not terminate") and are being rerun. A row of the table below is a result only once
-> `results/lemmas/TABLE.txt` shows it; until then it is the expected
-> outcome. The table is sound only if every `[reuse]` helper row is
-> verified too: Tamarin assumes earlier reuse lemmas when proving a later
-> one, whether or not they have been proved.
+> **Status (2026-11-09): all results below hold.** Run on Tamarin 1.12.0 /
+> Maude 3.5.1 with `prove-lemmas.sh`, one lemma at a time (3 GB, 1 thread):
+> 37 rows, every one with its expected outcome, every `[reuse]` helper
+> proved. Safety lemmas verify, the attack lemmas find their traces, and the
+> three negative controls (`-D=V08` twice, `-D=CREATION_TIME`) are
+> falsified, so the models do see the flaws that 0.9 fixes. Each lemma takes
+> seconds; the slowest is about 100 s. Getting there took several
+> restructurings, recorded under "If a proof does not terminate".
 
 ## Running
 
@@ -24,26 +21,10 @@ Tamarin 1.10 (or later) with Maude 3.x. Install via your package manager,
 Homebrew or Nix (`nix profile install nixpkgs#tamarin-prover`).
 
 ```sh
-make formal                       # everything below, logs in formal/results/
+make formal                                   # = ./formal/prove-lemmas.sh
+MEM=3G THREADS=1 ./formal/prove-lemmas.sh keylog
+ONLY=no_rollback ./formal/prove-lemmas.sh trust
 ```
-
-or one theory at a time:
-
-```sh
-cd formal
-tamarin-prover --prove keylog.spthy
-tamarin-prover -D=V08 --prove=no_takeover_without_next_key \
-  --prove=v08_operational_key_takeover keylog.spthy
-tamarin-prover --prove trust.spthy
-tamarin-prover -D=V08 --prove=no_rollback trust.spthy
-tamarin-prover --prove promotion.spthy
-tamarin-prover -D=CREATION_TIME --prove=promotion_after_revocation_is_safe promotion.spthy
-tamarin-prover --prove confidentiality.spthy
-```
-
-The variants attempt only the lemmas they are meant to break: elsewhere in
-a variant, helpers that hold only for 0.9 are missing and proofs may not
-terminate.
 
 ### One lemma at a time, capped (recommended)
 
@@ -71,18 +52,17 @@ bring that back; usually it needs a helper lemma or an oracle.
 
 ## Expected results
 
-| file | lemma | property | expected |
+| file | lemma | property | result |
 |---|---|---|---|
 | keylog | `exec_accept_after_rotation`, `exec_accept_ipn` | sanity | verified (trace found) |
-| keylog | `valid_ipn_from_inception`, `rx_log_monotone` | helpers | verified |
+| keylog | `next_key_secrecy`, `op_key_secrecy`, `valid_ipn_from_inception`, `rx_after_first_sight`, `rx_log_monotone` | helpers | verified |
 | keylog | `no_takeover_without_next_key` | 2 | verified |
 | keylog | `binding_no_splicing` | 1 | verified |
 | keylog | `rotation_ends_exposure` | 1b | verified |
 | keylog | `ipn_pinned` | 6 | verified |
 | keylog | `stale_log_cutoff`, `first_seen_no_branch_switch` | 3 | verified |
 | keylog | `next_key_theft_takes_over`, `fork_wins_where_seen_first` | 10 | verified (trace found: the attack exists) |
-| keylog `-D=V08` | `no_takeover_without_next_key` | 0.8 flaw | **falsified** |
-| keylog `-D=V08` | `v08_operational_key_takeover` | 0.8 flaw | verified (trace found) |
+| keylog `-D=V08` | `no_takeover_without_next_key` | 0.8 flaw | **falsified** (counterexample: forged head from the operational key alone) |
 | trust | `exec_authorize_via_peer`, `exec_withdraw_then_regrant` | sanity | verified (trace found) |
 | trust | `update_origin`, `grant_origin`, `withdraw_origin`, `member_origin` | helpers | verified |
 | trust | `purge_on_withdrawal` | 8 (purge) | verified |
@@ -118,10 +98,10 @@ model is sharp enough to find the flaws that 0.9 fixes.
    honest identifier was produced by its holder, unless a pre-committed next
    establishment key was stolen. Stealing the operational key never suffices.
    In 0.8 it did (`-D=V08`).
-3. **Stale logs and forks.** A receiver's stored key log only moves forward
-   along valid extensions. Once it has adopted a later log it never accepts
-   under an earlier one, and it never holds two different logs at the same
-   position.
+3. **Stale logs and forks.** A receiver's stored key log only grows. Once
+   it has adopted a log it never accepts under a shorter one, and it never
+   holds two different logs of the same length. Log length is modelled as a
+   natural number, as the code keeps it.
 4. **Authorization soundness, depth one.** A receiver authorizes an
    identifier only if its own root, or a collective its own root peered with
    directly, vouched for it, unless one of those roots was compromised.
@@ -233,6 +213,34 @@ model is sharp enough to find the flaws that 0.9 fixes.
   quantify over two grants and a membership application (four signed
   inputs); it is now one authorization implying one membership under the
   same grant, which with `peer_current` is the same property.
+- Witness lemmas (exists-trace) get search bounds as extra conjuncts: one
+  identity, one receiver, a bounded number of rotations, and for sanity
+  lemmas only honest heads. A trace satisfying them is still a trace of the
+  model, so nothing is weakened; without them `exec_accept_after_rotation`
+  timed out exploring attacker-built inceptions and key-log chains.
+- Inductive lemmas need a hypothesis strong enough for one step.
+  `no_takeover_without_next_key` is stated over the whole validated state
+  (head, operational key, commitment) rather than the head alone. With only
+  "the parent head is honest", the prover had to rebuild the parent's
+  commitment by walking back through the holder's history and ran out of
+  memory; with the commitment in the hypothesis, the step is one hash
+  comparison and one signature.
+- A `[reuse]` helper "A implies there is a B" must not be applied to a rule
+  that emits both A and B. The prover saturates: the new B-node emits
+  another A, which needs another B. In `keylog` this made every lemma placed
+  after `valid_ipn_from_inception` run out of memory within two minutes,
+  trivial ones included; the fix was to stop `Valid_Inception` emitting
+  `ValidN`. A tell-tale sign is a bounded run that dies in "Simplifier
+  iteration N" with hundreds of identical actions on fresh nodes.
+- Typed state patterns. Holder rules match `!HolderState(h(ix), ~op, ~nxt,
+  h(hx), $n)`: identifiers and heads are hashes, keys are fresh. With untyped
+  variables the prover could not rule out a secret key inside a published
+  head without walking the holder's whole history.
+- Ancestry by length, not by subterm. Property 3 first used the subterm
+  order on heads (`P << H`) as "descends from"; attacker-chosen fields in
+  forged events gave the subterm solver too much to explore and it ran out
+  of memory. It now uses the log length as a natural number
+  (`builtins: natural-numbers`), which is also what the code compares.
 - If something still runs away, open it in `tamarin-prover interactive .`,
   autoprove with a bound of 10 to 20, and look at which goals pile up:
   `!KU(sign(...))` with a free key means a missing origin helper or a

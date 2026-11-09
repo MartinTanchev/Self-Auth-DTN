@@ -18,7 +18,7 @@ cargo run --example demo                      # narrated end-to-end walkthrough
 cargo run --release --example refscenario     # CCSDS lunar and Mars reference scenarios
 cargo build --lib --no-default-features --features pq --target thumbv7em-none-eabihf   # bare metal
 UD3TN_DIR=~/ud3tn ./integrations/ud3tn/run-local.sh   # two real uD3TN nodes
-./formal/prove-lemmas.sh                      # Tamarin proofs, one lemma at a time
+make formal                                   # Tamarin proofs, one lemma at a time
 ./scripts/run-all.sh                          # everything above, logged
 ```
 
@@ -106,8 +106,9 @@ another arrived first.
 - **Formal models.** Tamarin theories for binding, rotation, first-seen
   logs, authorization, rollback, promotion and confidentiality, each with a
   negative control that reintroduces an old flaw and must be falsified.
-  `confidentiality`, `promotion` and `trust`: every lemma verified, negative
-  controls falsified. `keylog`: in progress. See
+  All 37 lemmas give their expected result: safety properties verified,
+  attacks found where the design admits them, and the negative controls
+  falsified, so the models do catch the flaws 0.9 fixed. See
   [`formal/README.md`](formal/README.md).
 
 ## Overhead (post-quantum, per bundle)

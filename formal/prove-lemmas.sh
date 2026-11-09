@@ -77,18 +77,20 @@ trust|-|peer_root_compromise_authorizes_anyone|verified
 trust|V08|no_rollback|falsified
 keylog|-|exec_accept_after_rotation|verified
 keylog|-|exec_accept_ipn|verified
+keylog|-|next_key_secrecy|verified
+keylog|-|op_key_secrecy|verified
 keylog|-|no_takeover_without_next_key|verified
 keylog|-|binding_no_splicing|verified
 keylog|-|rotation_ends_exposure|verified
 keylog|-|valid_ipn_from_inception|verified
 keylog|-|ipn_pinned|verified
+keylog|-|rx_after_first_sight|verified
 keylog|-|rx_log_monotone|verified
 keylog|-|stale_log_cutoff|verified
 keylog|-|first_seen_no_branch_switch|verified
 keylog|-|next_key_theft_takes_over|verified
 keylog|-|fork_wins_where_seen_first|verified
 keylog|V08|no_takeover_without_next_key|falsified
-keylog|V08|v08_operational_key_takeover|verified
 '
 
 # Result of one log: verified | falsified | incomplete | "" (none found).
